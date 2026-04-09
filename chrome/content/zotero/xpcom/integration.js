@@ -582,6 +582,7 @@ Zotero.Integration = new function () {
 			session._removeCodeFields = {};
 			session._deleteFields = {};
 			session._bibliographyFields = [];
+			session._bibliographyFieldsByIndex = null;
 			session._shouldMerge = false;
 			session._transactionUpToDate = false;
 
@@ -1065,6 +1066,7 @@ Zotero.Integration.Session = function (doc, app) {
 	this._removeCodeFields = {};
 	this._deleteFields = {};
 	this._bibliographyFields = [];
+	this._bibliographyFieldsByIndex = null;
 
 	this.sessionID = Zotero.randomString();
 	Zotero.Integration.sessions[this.sessionID] = this;
@@ -1163,6 +1165,7 @@ Zotero.Integration.Session.prototype.updateFromDocument = async function (forceU
 	this._removeCodeFields = {};
 	this._deleteFields = {};
 	this._bibliographyFields = [];
+	this._bibliographyFieldsByIndex = null;
 	
 	var timer = new Zotero.Integration.Timer();
 	timer.start();
@@ -1258,7 +1261,11 @@ Zotero.Integration.Session.prototype.updateDocument = async function (forceCitat
 	await this._updateCitations();
 	this.progressBar.finishSegment();
 	this.progressBar.start();
-	await this._updateDocument(forceCitations, forceBibliography, ignoreCitationChanges)
+	// Try batch update on Mac first; fall back to per-field if it fails or isn't applicable
+	var batchSuccess = await this._batchUpdateDocumentMac(forceCitations, forceBibliography, ignoreCitationChanges);
+	if (!batchSuccess) {
+		await this._updateDocument(forceCitations, forceBibliography, ignoreCitationChanges);
+	}
 	this.progressBar.finishSegment();
 
 	var diff = this.timer.stop();
@@ -1293,10 +1300,186 @@ Zotero.Integration.Session.prototype.updateDocument = async function (forceCitat
 };
 
 /**
+ * Batch update all fields via a single VBA macro execution on Mac.
+ * Instead of ~1200 individual AppleScript IPC calls, this collects all updates,
+ * writes them to a temp file, and triggers one VBA macro that processes them in-process.
+ *
+ * @param {Boolean} forceCitations Whether to regenerate all citations
+ * @param {Boolean} forceBibliography Whether to regenerate all bibliography entries
+ * @param {Boolean} [ignoreCitationChanges] Whether to ignore changes to citations that have been
+ *	modified since they were created, instead of showing a warning
+ * @returns {Boolean} true if batch update succeeded, false if caller should fall back to per-field
+ */
+Zotero.Integration.Session.prototype._batchUpdateDocumentMac = async function (forceCitations, forceBibliography,
+		ignoreCitationChanges) {
+	// Only use batch mode on Mac Word with enough fields to justify the overhead
+	if (!this.agent || !this.agent.startsWith('MacWord')) return false;
+
+	var indicesToUpdate = Object.keys(this.processIndices);
+	if (this.bibliography && Object.keys(this.citationsByIndex).length
+			&& (this.bibliographyHasChanged || forceBibliography)) {
+		for (let field of this._bibliographyFields) {
+			indicesToUpdate.push(field.index);
+		}
+	}
+
+	// Not worth batching for small updates
+	if (indicesToUpdate.length < 5) return false;
+
+	Zotero.debug(`Integration: Mac batch update for ${indicesToUpdate.length} fields`);
+
+	// Collect all updates
+	var updates = [];
+
+	// Process citations
+	for (let i of indicesToUpdate) {
+		var citation = this.citationsByIndex[i];
+		if (citation) {
+			if (!citation.properties.dontUpdate) {
+				var formattedCitation = citation.properties.custom
+					? citation.properties.custom : citation.text;
+
+				// Skip change detection prompts in batch mode (too disruptive)
+				// Update citation text if changed
+				if (forceCitations == FORCE_CITATIONS_RESET_TEXT
+						|| ((formattedCitation && citation.properties.formattedCitation !== formattedCitation)
+						&& !citation.properties.dontUpdate)) {
+
+					var text = formattedCitation;
+					// Handle delayed citation styling
+					var wasDelayed = citation.properties.formattedCitation
+						&& citation.properties.formattedCitation.includes(DELAYED_CITATION_RTF_STYLING);
+					if (this.outputFormat == 'rtf' && wasDelayed) {
+						text = `${DELAYED_CITATION_RTF_STYLING_CLEAR}{${formattedCitation}}`;
+					}
+
+					updates.push({ fieldIndex: i, action: 'T', data: text });
+					citation.properties.formattedCitation = formattedCitation;
+					// We can't read back getText() in batch mode, so set plainCitation
+					// to stripped text (good enough for change detection next time)
+					if (this.outputFormat == 'rtf' && text.includes('\\')) {
+						citation.properties.plainCitation = text.replace(/\{\\rtf\s?|\}|\\[a-z]+\s?/g, '');
+					} else {
+						citation.properties.plainCitation = text;
+					}
+				}
+			}
+
+			var serializedCitation = citation.serialize();
+			if (serializedCitation != citation.properties.field) {
+				updates.push({ fieldIndex: i, action: 'C', data: serializedCitation });
+			}
+		}
+		else {
+			// Bibliography field
+			if (!this._bibliographyFieldsByIndex) {
+				this._bibliographyFieldsByIndex = new Map();
+				for (let f of this._bibliographyFields) {
+					this._bibliographyFieldsByIndex.set(f.index, f);
+				}
+			}
+			let bibliographyField = this._bibliographyFieldsByIndex.get(i)
+				|| this._bibliographyFieldsByIndex.get(parseInt(i));
+			if (!bibliographyField) continue;
+
+			if (forceBibliography || this.bibliographyDataHasChanged) {
+				let code = this.bibliography.serialize();
+				updates.push({ fieldIndex: i, action: 'C', data: code });
+			}
+
+			var bib = this.bibliography.getCiteprocBibliography(this.style);
+			if (bib) {
+				var bibliographyText;
+				if (this.outputFormat == 'rtf') {
+					bibliographyText = bib[0].bibstart+bib[1].join("\\\r\n")+"\\\r\n"+bib[0].bibend;
+				} else {
+					bibliographyText = bib[0].bibstart+bib[1].join("")+bib[0].bibend;
+				}
+				updates.push({ fieldIndex: i, action: 'T', data: bibliographyText });
+
+				if (!this.data.style.bibliographyStyleHasBeenSet) {
+					// Bibliography style must be set via the normal path (single IPC call, acceptable)
+					var bibStyle = Zotero.Cite.getBibliographyFormatParameters(bib);
+					await this._doc.setBibliographyStyle(bibStyle.firstLineIndent, bibStyle.indent,
+						bibStyle.lineSpacing, bibStyle.entrySpacing, bibStyle.tabStops, bibStyle.tabStops.length);
+					this.data.style.bibliographyStyleHasBeenSet = true;
+				}
+			}
+		}
+	}
+
+	// Add remove-code and delete operations
+	var removeCodeFields = Object.keys(this._removeCodeFields).sort((a, b) => b - a);
+	for (let fieldIndex of removeCodeFields) {
+		updates.push({ fieldIndex: parseInt(fieldIndex), action: 'R', data: '' });
+	}
+	var deleteFields = Object.keys(this._deleteFields).sort((a, b) => b - a);
+	for (let fieldIndex of deleteFields) {
+		updates.push({ fieldIndex: parseInt(fieldIndex), action: 'D', data: '' });
+	}
+
+	if (updates.length === 0) return true; // Nothing to update
+
+	// Write batch file
+	var batchFilePath = Zotero.getTempDirectory().path + '/zotero_batch_update.txt';
+	var escapeData = (s) => s.replace(/\\/g, '\\\\').replace(/\n/g, '\\n').replace(/\r/g, '');
+
+	var lines = [String(updates.length)];
+	for (let update of updates) {
+		lines.push(`${update.fieldIndex}\t${update.action}`);
+		lines.push(escapeData(update.data));
+	}
+
+	await Zotero.File.putContentsAsync(batchFilePath, lines.join('\n'));
+
+	// Execute VBA macro via AppleScript
+	var escapedPath = batchFilePath.replace(/"/g, '\\"');
+	var script = `tell application "Microsoft Word"
+	do Visual Basic "ZoteroBatchUpdateFromFile """ & "${escapedPath}" & """"
+end tell`;
+
+	Zotero.debug(`Integration: Executing Mac batch update with ${updates.length} operations`);
+	var timer = new Zotero.Integration.Timer();
+	timer.start();
+
+	try {
+		Zotero.Utilities.Internal.executeAppleScript(script, true);
+
+		// Check for completion signal
+		var doneFile = batchFilePath + '.done';
+		var errorFile = batchFilePath + '.error';
+
+		if (await IOUtils.exists(errorFile)) {
+			var errorMsg = await Zotero.File.getContentsAsync(errorFile);
+			Zotero.debug(`Integration: Mac batch update VBA error: ${errorMsg}`);
+			// Clean up signal files
+			try { await IOUtils.remove(errorFile); } catch(e) {}
+			try { await IOUtils.remove(batchFilePath); } catch(e) {}
+			return false; // Fall back to per-field updates
+		}
+
+		var elapsed = timer.stop();
+		Zotero.debug(`Integration: Mac batch update completed ${updates.length} operations in ${elapsed}s`);
+
+		// Clean up
+		try { await IOUtils.remove(doneFile); } catch(e) {}
+		try { await IOUtils.remove(batchFilePath); } catch(e) {}
+
+		this.processIndices = {};
+		return true;
+	}
+	catch (e) {
+		Zotero.debug(`Integration: Mac batch update failed, falling back to per-field: ${e}`);
+		try { await IOUtils.remove(batchFilePath); } catch(e2) {}
+		return false;
+	}
+};
+
+/**
  * Helper function to update bibliographys and fields within a document
  * @param {Boolean} forceCitations Whether to regenerate all citations
  * @param {Boolean} forceBibliography Whether to regenerate all bibliography entries
- * @param {Boolean} [ignoreCitationChanges] Whether to ignore changes to citations that have been 
+ * @param {Boolean} [ignoreCitationChanges] Whether to ignore changes to citations that have been
  *	modified since they were created, instead of showing a warning
  */
 Zotero.Integration.Session.prototype._updateDocument = async function (forceCitations, forceBibliography,
@@ -1355,8 +1538,10 @@ Zotero.Integration.Session.prototype._updateDocument = async function (forceCita
 				Zotero.logError(e);
 			}
 		}
-		// Jump to next event loop step for UI updates
-		await Zotero.Promise.delay();
+		// Yield to event loop periodically for UI updates (every 10 fields instead of every field)
+		if (nUpdated % 10 == 0) {
+			await Zotero.Promise.delay();
+		}
 		
 		var citation = this.citationsByIndex[i];
 		if (citation) {
@@ -1425,13 +1610,15 @@ Zotero.Integration.Session.prototype._updateDocument = async function (forceCita
 			nUpdated++;
 		}
 		else {
-			let bibliographyField;
-			for (let f of this._bibliographyFields) {
-				if (f.index == i) {
-					bibliographyField = f;
-					break;
+			// Use pre-built index for O(1) bibliography field lookup
+			if (!this._bibliographyFieldsByIndex) {
+				this._bibliographyFieldsByIndex = new Map();
+				for (let f of this._bibliographyFields) {
+					this._bibliographyFieldsByIndex.set(f.index, f);
 				}
 			}
+			let bibliographyField = this._bibliographyFieldsByIndex.get(i)
+				|| this._bibliographyFieldsByIndex.get(parseInt(i));
 			if (!bibliographyField) {
 				throw new Error(`Attempting to update field ${i} which does not exist`);
 			}
@@ -2194,9 +2381,17 @@ Zotero.Integration.Session.prototype.addCitation = async function (index, noteIn
 				// if index is greater than the last index, add to end
 				byItemID.push(citation);
 			} else {
-				// otherwise, splice in at appropriate location
-				for (var j=0; byItemID[j].properties.zoteroIndex < index && j<byItemID.length-1; j++) {}
-				byItemID.splice(j++, 0, citation);
+				// Use binary search to find insertion position instead of linear scan
+				let lo = 0, hi = byItemID.length;
+				while (lo < hi) {
+					let mid = (lo + hi) >>> 1;
+					if (byItemID[mid].properties.zoteroIndex < index) {
+						lo = mid + 1;
+					} else {
+						hi = mid;
+					}
+				}
+				byItemID.splice(lo, 0, citation);
 			}
 		}
 	}
@@ -2256,41 +2451,106 @@ Zotero.Integration.Session.prototype._updateCitations = async function () {
 	Zotero.debug(Object.keys(this.newIndices));
 	Zotero.debug("Integration: Indices of updated citations");
 	Zotero.debug(Object.keys(this.updateIndices));
-	
+
 	let citations, fieldToCitationIdxMapping, citationToFieldIdxMapping;
-	for (let indexList of [this.newIndices, this.updateIndices]) {
-		for (let index in indexList) {
-			if (indexList == this.newIndices) {
-				delete this.newIndices[index];
-				delete this.updateIndices[index];
-				[citations, fieldToCitationIdxMapping, citationToFieldIdxMapping] =
-					this.getCiteprocLists()
+
+	// Process new citations: sort indices and build citeprocLists incrementally
+	// instead of rebuilding from scratch after each insertion (O(n) vs O(n²))
+	let newIndicesSorted = Object.keys(this.newIndices).map(Number).sort((a, b) => a - b);
+	if (newIndicesSorted.length) {
+		// Build the initial list once (excluding all newIndices)
+		[citations, fieldToCitationIdxMapping, citationToFieldIdxMapping] =
+			this.getCiteprocLists();
+
+		let newProcessed = 0;
+		for (let index of newIndicesSorted) {
+			delete this.newIndices[index];
+			delete this.updateIndices[index];
+
+			// Yield to event loop periodically for UI updates (every 10 citations)
+			if (newProcessed++ % 10 == 0) {
+				await Zotero.Promise.delay();
 			}
-		
-			// Jump to next event loop step for UI updates
-			await Zotero.Promise.delay();
-			index = parseInt(index);
-			
+
 			var citation = this.citationsByIndex[index];
 			if (!citation) continue;
-			citation = citation.toJSON();
 
-			let citationsPre = citations.slice(0, citationToFieldIdxMapping[index]);
-			var citationsPost = citations.slice(citationToFieldIdxMapping[index]+1);
-			
-			Zotero.debug("Integration: style.processCitationCluster("+citation.toSource()+", "+citationsPre.toSource()+", "+citationsPost.toSource());
-			let [info, newCitations] = this.style.processCitationCluster(citation, citationsPre, citationsPost);
-			
+			// Insert this citation into the existing lists at the correct position
+			// using binary search instead of rebuilding from scratch
+			let insertPos = 0;
+			let lo = 0, hi = citations.length;
+			while (lo < hi) {
+				let mid = (lo + hi) >>> 1;
+				if (fieldToCitationIdxMapping[mid] < index) {
+					lo = mid + 1;
+				} else {
+					hi = mid;
+				}
+			}
+			insertPos = lo;
+
+			citations.splice(insertPos, 0, [citation.citationID, citation.properties.noteIndex]);
+			// Shift mappings for entries after the insertion point
+			let newFieldMap = {};
+			let newCitationMap = {};
+			for (let k = citations.length - 1; k > insertPos; k--) {
+				newFieldMap[k] = fieldToCitationIdxMapping[k - 1];
+				newCitationMap[newFieldMap[k]] = k;
+			}
+			newFieldMap[insertPos] = index;
+			newCitationMap[index] = insertPos;
+			for (let k = 0; k < insertPos; k++) {
+				newFieldMap[k] = fieldToCitationIdxMapping[k];
+				newCitationMap[newFieldMap[k]] = k;
+			}
+			fieldToCitationIdxMapping = newFieldMap;
+			citationToFieldIdxMapping = newCitationMap;
+
+			var citationJSON = citation.toJSON();
+			let citationsPre = citations.slice(0, insertPos);
+			var citationsPost = citations.slice(insertPos + 1);
+
+			Zotero.debug("Integration: style.processCitationCluster("+citationJSON.toSource()+", "+citationsPre.toSource()+", "+citationsPost.toSource());
+			let [info, newCitations] = this.style.processCitationCluster(citationJSON, citationsPre, citationsPost);
+
 			this.bibliographyHasChanged |= info.bibchange;
-			
+
 			for (let citationInfo of newCitations) {
 				let idx = fieldToCitationIdxMapping[citationInfo[0]], text = citationInfo[1];
 				this.processIndices[idx] = true;
 				this.citationsByIndex[idx].text = text;
 			}
 		}
-		[citations, fieldToCitationIdxMapping, citationToFieldIdxMapping] =
-			this.getCiteprocLists();
+	}
+
+	// Process updated citations (these are already in the list)
+	[citations, fieldToCitationIdxMapping, citationToFieldIdxMapping] =
+		this.getCiteprocLists();
+	let updateProcessed = 0;
+	for (let index in this.updateIndices) {
+		// Yield to event loop periodically for UI updates (every 10 citations)
+		if (updateProcessed++ % 10 == 0) {
+			await Zotero.Promise.delay();
+		}
+		index = parseInt(index);
+
+		var citation = this.citationsByIndex[index];
+		if (!citation) continue;
+		var citationJSON = citation.toJSON();
+
+		let citationsPre = citations.slice(0, citationToFieldIdxMapping[index]);
+		var citationsPost = citations.slice(citationToFieldIdxMapping[index]+1);
+
+		Zotero.debug("Integration: style.processCitationCluster("+citationJSON.toSource()+", "+citationsPre.toSource()+", "+citationsPost.toSource());
+		let [info, newCitations] = this.style.processCitationCluster(citationJSON, citationsPre, citationsPost);
+
+		this.bibliographyHasChanged |= info.bibchange;
+
+		for (let citationInfo of newCitations) {
+			let idx = fieldToCitationIdxMapping[citationInfo[0]], text = citationInfo[1];
+			this.processIndices[idx] = true;
+			this.citationsByIndex[idx].text = text;
+		}
 	}
 }
 

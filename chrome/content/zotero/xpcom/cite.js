@@ -619,8 +619,9 @@ Zotero.Cite.System = function ({ automaticJournalAbbreviations, uppercaseSubtitl
 		this.getAbbreviation = Zotero.Cite.getAbbreviation;
 	}
 	if (uppercaseSubtitles) {
-		this.uppercase_subtitles = true;  
+		this.uppercase_subtitles = true;
 	}
+	this._cache = {};
 };
 
 Zotero.Cite.System.prototype = {
@@ -633,7 +634,7 @@ Zotero.Cite.System.prototype = {
 	"retrieveItem":function retrieveItem(item) {
 		var zoteroItem, slashIndex;
 		if(typeof item === "object" && item !== null &&  item instanceof Zotero.Item) {
-			//if(this._cache[item.id]) return this._cache[item.id];
+			if(this._cache[item.id]) return this._cache[item.id];
 			zoteroItem = item;
 		} else if(typeof item === "string" && (slashIndex = item.indexOf("/")) !== -1) {
 			// is an embedded item
@@ -648,7 +649,7 @@ Zotero.Cite.System.prototype = {
 			}
 		} else {
 			// is an item ID
-			//if(this._cache[item]) return this._cache[item];
+			if(this._cache[item]) return this._cache[item];
 			try {
 				zoteroItem = Zotero.Items.get(item);
 			} catch(e) {}
@@ -657,12 +658,12 @@ Zotero.Cite.System.prototype = {
 		if(!zoteroItem) {
 			throw new Error("Zotero.Cite.System.retrieveItem called on non-item "+item);
 		}
-		
+
 		var cslItem = Zotero.Utilities.Item.itemToCSLJSON(zoteroItem);
-		
+
 		// TEMP: citeproc-js currently expects the id property to be the item DB id
 		cslItem.id = zoteroItem.id;
-		
+
 		if (!Zotero.Prefs.get("export.citePaperJournalArticleURL")) {
 			var itemType = Zotero.ItemTypes.getName(zoteroItem.itemTypeID);
 			// don't return URL or accessed information for journal articles if a
@@ -674,7 +675,10 @@ Zotero.Cite.System.prototype = {
 				delete cslItem.accessed;
 			}
 		}
-		
+
+		// Cache the CSL item to avoid repeated itemToCSLJSON conversions
+		this._cache[zoteroItem.id] = cslItem;
+
 		return cslItem;
 	},
 
@@ -696,6 +700,20 @@ Zotero.Cite.System.prototype = {
 				break;
 		}
 		return Zotero.Cite.Locale.get(lang);
+	},
+
+	/**
+	 * Invalidate cached CSL data for specific item IDs, or clear all if no IDs given
+	 * @param {Array<Number>} [itemIDs] - Item IDs to invalidate; if omitted, clears entire cache
+	 */
+	"invalidateCache":function invalidateCache(itemIDs) {
+		if (!itemIDs) {
+			this._cache = {};
+		} else {
+			for (let id of itemIDs) {
+				delete this._cache[id];
+			}
+		}
 	}
 };
 
